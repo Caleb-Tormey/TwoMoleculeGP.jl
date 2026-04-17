@@ -198,9 +198,9 @@ savefig(p, "N2_Sampling_Baseline_Updated.png")
 println("Done! Plot saved as 'N2_Sampling_Baseline_Updated.png'.")
 
 # ==========================================
-# 8. Phase 3: The Constrained GP (Zero-Tolerance Rules)
+# 8. Phase 3: The Constrained GP (Domain-Restricted Sum Rules)
 # ==========================================
-println("Building Constrained GP with full RISM sum rules...")
+println("Building Constrained GP with targeted RISM sum rules...")
 
 r_val = r_grid
 N_v = length(r_val)
@@ -212,9 +212,10 @@ y_AB = h_AB_mean; v_AB = h_AB_var .+ 1e-8
 y_stack = vcat(y_AA, y_BB, y_AB)
 v_stack = vcat(v_AA, v_BB, v_AB)
 
+# Using the Matern 5/2 Kernel to properly handle the sharp LJ wall
 l_scale = 0.5 
 sig_var = 1.0 
-kernel = SqExponentialKernel() ∘ ScaleTransform(1.0 / l_scale)
+kernel = Matern52Kernel() ∘ ScaleTransform(1.0 / l_scale)
 
 K_base = sig_var .* kernelmatrix(kernel, r_val)
 K_joint = zeros(Float64, 3*N_v, 3*N_v)
@@ -222,11 +223,19 @@ K_joint[1:N_v, 1:N_v]                 = K_base
 K_joint[N_v+1:2*N_v, N_v+1:2*N_v]     = K_base
 K_joint[2*N_v+1:3*N_v, 2*N_v+1:3*N_v] = K_base
 
-# 3. Construct the Constraint Matrix (C_mat) - 3 Exact Rows
+# 3. Construct the Constraint Matrix (C_mat) with a Cutoff
+# We only apply the sum rule weights where the physical structure exists
+r_cut_sum_rule = 20.0 
+
 C_mat = zeros(Float64, 3, 3*N_v)
 for i in 1:N_v
-    w2_i = (r_val[i]^2) * dr
-    w4_i = (r_val[i]^4) * dr
+    if r_val[i] <= r_cut_sum_rule
+        w2_i = (r_val[i]^2) * dr
+        w4_i = (r_val[i]^4) * dr
+    else
+        w2_i = 0.0
+        w4_i = 0.0
+    end
     
     # Constraint 1: O(1) [AA - AB = 0]
     C_mat[1, i]           =  w2_i
@@ -254,7 +263,7 @@ H_tilde[3*N_v + 1 : 3*N_v + 3, :] = C_mat
 
 y_tilde = vcat(y_stack, [0.0, 0.0, 0.0])
 
-# VITAL FIX: Exact 0.0 for constraint variance!
+# Zero-variance for strict enforcement
 Sigma_tilde = diagm(vcat(v_stack, [0.0, 0.0, 0.0]))
 
 # 5. Calculate Exact Posterior Mean
@@ -276,14 +285,16 @@ chk_Det_O1   = zeros(Float64, 3*N_v)
 chk_Det_Ok2  = zeros(Float64, 3*N_v)
 
 for i in 1:N_v
-    w2 = (r_val[i]^2)*dr
-    w4 = (r_val[i]^4)*dr
-    
-    chk_AA_AB_O1[i] = w2; chk_AA_AB_O1[2*N_v + i] = -w2
-    chk_BB_AB_O1[N_v + i] = w2; chk_BB_AB_O1[2*N_v + i] = -w2
-    
-    chk_Det_O1[i] = w2; chk_Det_O1[N_v + i] = w2; chk_Det_O1[2*N_v + i] = -2.0*w2
-    chk_Det_Ok2[i] = w4; chk_Det_Ok2[N_v + i] = w4; chk_Det_Ok2[2*N_v + i] = -2.0*w4
+    if r_val[i] <= r_cut_sum_rule
+        w2 = (r_val[i]^2)*dr
+        w4 = (r_val[i]^4)*dr
+        
+        chk_AA_AB_O1[i] = w2; chk_AA_AB_O1[2*N_v + i] = -w2
+        chk_BB_AB_O1[N_v + i] = w2; chk_BB_AB_O1[2*N_v + i] = -w2
+        
+        chk_Det_O1[i] = w2; chk_Det_O1[N_v + i] = w2; chk_Det_O1[2*N_v + i] = -2.0*w2
+        chk_Det_Ok2[i] = w4; chk_Det_Ok2[N_v + i] = w4; chk_Det_Ok2[2*N_v + i] = -2.0*w4
+    end
 end
 
 println("\n--- COMPREHENSIVE SUM RULE VERIFICATION ---")
@@ -292,6 +303,27 @@ println("O(1) [BB - AB]        Raw: ", sum(chk_BB_AB_O1 .* y_stack), " | Smooth:
 println("O(1) [AA+BB-2AB]      Raw: ", sum(chk_Det_O1 .* y_stack),   " | Smooth: ", sum(chk_Det_O1 .* mu_post))
 println("O(k^2) [AA+BB-2AB]    Raw: ", sum(chk_Det_Ok2 .* y_stack),  " | Smooth: ", sum(chk_Det_Ok2 .* mu_post))
 println("-------------------------------------------\n")
+println("-------------------------------------------\n")
+
+# ==========================================
+# 9b. r-Space Smoothing Visualization
+# ==========================================
+println("Generating r-space smoothing plot...")
+
+# 1. Raw Data: Scatter plot to show the underlying MC noise
+p_smooth = scatter(r_grid, h_AA_mean, label="Raw Mean (AA)", 
+             markersize=3, markercolor=:black, markerstrokewidth=0, alpha=0.4)
+
+# 2. Constrained GP: Solid line showing the physics-informed smoothing
+plot!(p_smooth, r_grid, h_AA_smooth, label="Constrained GP (AA)", 
+      linewidth=2, color=:blue)
+
+# 3. Formatting
+plot!(p_smooth, xlims=(0, 10), xlabel="r (Angstroms)", ylabel="h(r)", 
+      title="Domain-Restricted Constrained Smoothing")
+
+savefig(p_smooth, "N2_Constrained_GP_Smooth.png")
+println("Done! Smoothing plot saved as 'N2_Constrained_GP_Smooth.png'.")
 
 # ==========================================
 # 10. Phase 4: k-Space Verification

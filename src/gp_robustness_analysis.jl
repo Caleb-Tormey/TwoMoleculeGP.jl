@@ -175,6 +175,7 @@ function run_single_trial(trial_idx, seed_val)
 
     l_scale = 0.25  # Lower length scale to hug data tighter
     sig_var = 1.0 
+    #kernel = SqExponentialKernel() ∘ ScaleTransform(1.0 / l_scale)
     kernel = Matern52Kernel() ∘ ScaleTransform(1.0 / l_scale) # Switched to Matern 5/2
     
     K_base = sig_var .* kernelmatrix(kernel, r_grid)
