@@ -1,14 +1,14 @@
-using Statistics
+#=using Statistics
 using Base.Threads
 using LinearAlgebra
 using StaticArrays
 using Plots
 using AbstractGPs
-using KernelFunctions
+using KernelFunctions=#
 
-println("Starting N2 Two-Molecule Direct Sampling...")
-println("Running on $(Threads.nthreads()) threads.")
-
+#println("Starting N2 Two-Molecule Direct Sampling...")
+#println("Running on $(Threads.nthreads()) threads.")
+#=
 # ==========================================
 # 1. Physical Parameters (N2 System)
 # ==========================================
@@ -30,7 +30,7 @@ const N_steps = 50_000      # Steps per block
 const dr = 0.1              # Grid spacing (Angstroms)
 const N_grid = 2048         # Number of r grid points
 const r_max = N_grid * dr
-
+=#
 # ==========================================
 # 3. Helper Functions
 # ==========================================
@@ -39,6 +39,15 @@ const r_max = N_grid * dr
 @inline function repulsive_LJ(r::Float64)
     if r <= r_cut
         return 4.0 * epsilon * ((sigma/r)^12 - (sigma/r)^6) + epsilon
+    else
+        return 0.0
+    end
+end
+
+# Truncated and Shifted Lennard-Jones Potential
+@inline function lj_potential(r::Float64)
+    if r <= r_cut
+        return 4.0 * epsilon * ((sigma/r)^12 - (sigma/r)^6) - V_shift
     else
         return 0.0
     end
@@ -62,6 +71,46 @@ end
     end
 end
 
+@inline function get_W(r::Float64, W_arr::Vector{Float64}, dr::Float64)
+    # If r is beyond our grid, the solvation potential is 0.0
+    if r >= length(W_arr) * dr
+        return 0.0
+    end
+    
+    # Fast linear interpolation logic goes here...
+    # ...
+end
+
+# Fast linear interpolation for W(r) on a shifted grid: r_i = (i - 0.5) * dr
+@inline function get_W(r::Float64, W_arr::Vector{Float64}, dr::Float64, N_grid::Int)
+    # 1. Handle Long-Range Tail (r beyond the simulated grid)
+    if r >= (N_grid - 0.5) * dr
+        return 0.0
+    end
+    
+    # 2. Handle Hard Core (r smaller than the first grid point)
+    if r <= 0.5 * dr
+        @inbounds return W_arr[1]
+    end
+    
+    # 3. Fast Index Math
+    idx_float = (r / dr) + 0.5
+    idx_lower = floor(Int, idx_float)
+    
+    # 4. Fractional distance between the lower and upper bin
+    fraction = idx_float - idx_lower
+    
+    # 5. Extract and interpolate (using @inbounds to skip bounds-checking overhead)
+    @inbounds w_low = W_arr[idx_lower]
+    @inbounds w_up  = W_arr[idx_lower + 1]
+    
+    return w_low + fraction * (w_up - w_low)
+end
+
+function run_mc_sampling(N_steps::Int, N_blocks::Int, W_AA::Vector{Float64}, W_BB::Vector{Float64}, W_AB::Vector{Float64})
+    println("Starting MC Sampling block...")
+    
+# [Initialize your raw_hist and raw_norm matrices here]
 # ==========================================
 # 4. Memory Allocation
 # ==========================================
@@ -110,11 +159,22 @@ raw_norm_AB = zeros(Float64, N_grid, N_blocks)
         r_AB_dist = norm(r1A - r2B)
         r_BA_dist = norm(r1B - r2A)
         
-        # Calculate Boltzmann weight (Bare potential only, W(r) = 0 for baseline)
-        V_total = repulsive_LJ(r_AA_dist) + repulsive_LJ(r_BB_dist) + 
-                  repulsive_LJ(r_AB_dist) + repulsive_LJ(r_BA_dist)
+        #=# 1. Bare Lennard-Jones Potential
+        V_bare = repulsive_LJ(r_AA_dist) + repulsive_LJ(r_BB_dist) + 
+                 repulsive_LJ(r_AB_dist) + repulsive_LJ(r_BA_dist)
+        =#    
+        # 1. Bare Lennard-Jones Potential
+        V_bare = lj_potential(r_AA_dist) + lj_potential(r_BB_dist) + 
+                 lj_potential(r_AB_dist) + lj_potential(r_BA_dist)     
+
+        # 2. Add Dynamic Solvation Potential W(r)
+         W_total = get_W(r_AA_dist, W_AA, dr, N_grid) + 
+                   get_W(r_BB_dist, W_BB, dr, N_grid) + 
+                   get_W(r_AB_dist, W_AB, dr, N_grid) + 
+                   get_W(r_BA_dist, W_AB, dr, N_grid) # BA uses AB array by symmetry
         
-        weight = exp(-beta * V_total)
+        # 3. Total Boltzmann Weight
+        weight = exp(-beta * (V_bare + W_total))
         
         # Bin the data
         add_to_hist!(local_hist_AA, local_norm_AA, r_AA_dist, weight, z)
@@ -133,13 +193,39 @@ raw_norm_AB = zeros(Float64, N_grid, N_blocks)
     raw_hist_AB[:, m] = local_hist_AB
     raw_norm_AB[:, m] = local_norm_AB
 end
+# ==========================================
+    # Process Block Statistics (Converting Raw Hists to h(r))
+    # ==========================================
+    h_blocks_AA = zeros(Float64, N_grid, N_blocks)
+    h_blocks_BB = zeros(Float64, N_grid, N_blocks)
+    h_blocks_AB = zeros(Float64, N_grid, N_blocks)
 
+    for m in 1:N_blocks
+        h_blocks_AA[:, m] = (raw_hist_AA[:, m] ./ (raw_norm_AA[:, m] .+ 1e-10)) .- 1.0
+        h_blocks_BB[:, m] = (raw_hist_BB[:, m] ./ (raw_norm_BB[:, m] .+ 1e-10)) .- 1.0
+        h_blocks_AB[:, m] = (raw_hist_AB[:, m] ./ (raw_norm_AB[:, m] .+ 1e-10)) .- 1.0
+    end
+
+    # Calculate means and variances across the blocks, and flatten them to 1D vectors
+    h_AA_mean = vec(mean(h_blocks_AA, dims=2))
+    h_AA_var  = vec(var(h_blocks_AA, dims=2))
+    
+    h_BB_mean = vec(mean(h_blocks_BB, dims=2))
+    h_BB_var  = vec(var(h_blocks_BB, dims=2))
+    
+    h_AB_mean = vec(mean(h_blocks_AB, dims=2))
+    h_AB_var  = vec(var(h_blocks_AB, dims=2))
+
+    return h_AA_mean, h_AA_var, h_BB_mean, h_BB_var, h_AB_mean, h_AB_var
+end # <-- End of run_mc_sampling function
+
+#=
 println("Sampling complete. Processing statistics...")
 
 # ==========================================
 # 6. Data Processing
 # ==========================================
-r_grid = [ (i - 0.5) * dr for i in 1:N_grid ]
+#r_grid = [ (i - 0.5) * dr for i in 1:N_grid ]
 
 # --- Old Way: Global Average (AA only for the baseline plot) ---
 global_hist_AA = sum(raw_hist_AA, dims=2)
@@ -300,7 +386,7 @@ println("\nPerforming 3D Fourier Transforms...")
 
 # Define a high-resolution k-grid focusing on the low-k limit
 # (Avoid k exactly 0 to prevent divide-by-zero, start at k=0.01)
-k_grid = range(0.01, 1.5, length=300)
+#k_grid = range(0.01, 1.5, length=300)
 
 # 3D Spherical Fourier Transform Function
 function calc_h_hat(r_arr, h_arr, k_val)
@@ -354,3 +440,4 @@ plot!(p4, xlabel="k (1/Angstroms)", ylabel="Δh(k) / k²",
 
 savefig(p4, "N2_k_space_Fix.png")
 println("Done! Final k-space plot saved as 'N2_k_space_Fix.png'.")
+=#
